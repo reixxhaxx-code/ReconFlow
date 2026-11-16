@@ -1,7 +1,13 @@
 #!/usr/bin/env python3
-"""ReconFlow: lightweight recon workflow. Created by reixxhaxx."""
+"""ReconFlow - lightweight, sequential reconnaissance workflow.
+
+Created by reixxhaxx. Use only against domains you own or are authorized to assess.
+"""
+
+from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 import re
 import shutil
@@ -11,381 +17,484 @@ import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Iterable
 
-VERSION = "0.1.0"
+VERSION = "0.2.1"
 AUTHOR = "reixxhaxx"
-REQUIRED_TOOLS = ("subfinder", "findomain", "dnsx", "httpx")
-SILENT = False
-
 BANNER = r"""
- ____                        _____ _
-|  _ \ ___  ___ ___  _ __   |  ___| | _____      __
-| |_) / _ \/ __/ _ \| '_ \  | |_  | |/ _ \ \ /\ / /
-|  _ <  __/ (_| (_) | | | | |  _| | | (_) \ V  V /
-|_| \_\___|\___\___/|_| |_| |_|   |_|\___/ \_/\_/
-
+ ____                      ______ _
+|  _ \ ___  ___ ___  _ __  |  ____| | _____      __
+| |_) / _ \/ __/ _ \| '_ \ | |__  | |/ _ \ \ /\ / /
+|  _ <  __/ (_| (_) | | | ||  __| | | (_) \ V  V /
+|_|\_\___|\___\___/|_| |_||_|    |_|\___/ \_/\_/
 """
 
+WARNINGS: list[str] = []
+SILENT = False
 
-def info(message):
+
+def info(message: str) -> None:
     if not SILENT:
         print(f"[INFO] {message}")
 
 
-def warning(message):
+def warning(message: str) -> None:
+    WARNINGS.append(message)
     print(f"[WARN] {message}", file=sys.stderr)
 
 
-def error(message):
+def error(message: str) -> None:
     print(f"[ERROR] {message}", file=sys.stderr)
 
 
-def valid_domain(domain):
+def positive_int(value: str) -> int:
+    try:
+        number = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a positive integer") from exc
+    if number < 1:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return number
+
+
+def valid_domain(domain: str) -> bool:
     if not domain or len(domain) > 253:
         return False
     pattern = (
-        r"(?:[a-zA-Z0-9]"
-        r"(?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+"
+        r"(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+"
         r"[a-zA-Z]{2,63}"
     )
     return re.fullmatch(pattern, domain) is not None
 
 
-def check_dependencies():
-    missing = [tool for tool in REQUIRED_TOOLS if shutil.which(tool) is None]
-    if missing:
-        error("Missing required tools: " + ", ".join(missing))
-        error("Install the missing tools and run ReconFlow again.")
-        return False
-    info("All required tools are installed.")
-    return True
-
-
-def run_command(command, timeout=180):
+def run_command(command: list[str], timeout: int = 180) -> subprocess.CompletedProcess[str] | None:
     try:
-        result = subprocess.run(
-            command, capture_output=True, text=True,
-            timeout=timeout, check=False
+        return subprocess.run(
+            command, capture_output=True, text=True, timeout=timeout,
+            check=False, encoding="utf-8", errors="replace"
         )
-        if result.returncode != 0:
-            detail = (result.stderr or result.stdout or "").strip()
-            if detail:
-                warning(
-                    f"{command[0]} returned an error: "
-                    f"{detail.splitlines()[0][:200]}"
-                )
-        return result
     except FileNotFoundError:
-        warning(f"Tool not found: {command[0]}")
+        warning(f"Required executable not found: {command[0]}")
     except subprocess.TimeoutExpired:
         warning(f"{command[0]} timed out after {timeout} seconds.")
-    except Exception as exc:
-        warning(f"{command[0]} failed: {exc}")
+    except OSError as exc:
+        warning(f"Could not run {command[0]}: {exc}")
     return None
 
 
-def read_lines(file_path):
-    path = Path(file_path)
-    if not path.exists():
-        return []
+def read_lines(path: Path) -> list[str]:
     try:
-        return [
-            line.strip()
-            for line in path.read_text(
-                encoding="utf-8", errors="ignore"
-            ).splitlines()
-            if line.strip()
-        ]
+        return [line.strip() for line in path.read_text(encoding="utf-8", errors="replace").splitlines() if line.strip()]
+    except FileNotFoundError:
+        return []
     except OSError as exc:
         warning(f"Could not read {path}: {exc}")
         return []
 
 
-def save_lines(file_path, lines):
-    path = Path(file_path)
+def write_text(path: Path, content: str) -> bool:
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        content = "\n".join(lines)
-        path.write_text(
-            content + ("\n" if lines else ""), encoding="utf-8"
-        )
+        path.write_text(content, encoding="utf-8")
         return True
     except OSError as exc:
         error(f"Could not write {path}: {exc}")
         return False
 
 
-def discover_subfinder(domain, work_dir):
-    info("Starting Subfinder...")
-    output_file = work_dir / "subfinder.txt"
-    result = run_command([
-        "subfinder", "-d", domain, "-silent", "-o", str(output_file)
-    ])
+def save_lines(path: Path, lines: Iterable[str]) -> bool:
+    values = list(lines)
+    return write_text(path, "\n".join(values) + ("\n" if values else ""))
+
+
+def check_dependencies(dns_mode: str) -> bool:
+    required = ["subfinder", "findomain", "dig", "httpx"]
+    if dns_mode in ("udp", "auto"):
+        required.append("dnsx")
+    missing = [name for name in required if shutil.which(name) is None]
+    if missing:
+        error("Missing tools: " + ", ".join(missing))
+        error("Install them and ensure they are available in PATH.")
+        return False
+
+    httpx_help = run_command(["httpx", "-h"], timeout=10)
+    help_text = ""
+    if httpx_help:
+        help_text = (httpx_help.stdout or "") + (httpx_help.stderr or "")
+    if "-status-code" not in help_text or "-json" not in help_text:
+        error("The 'httpx' executable does not look like ProjectDiscovery httpx.")
+        error("Check that ProjectDiscovery httpx is first in PATH (not Python HTTPX).")
+        return False
+    return True
+
+
+def discover_subfinder(domain: str, work: Path) -> list[str]:
+    info("Running Subfinder...")
+    output = work / "subfinder.txt"
+    result = run_command(["subfinder", "-d", domain, "-silent", "-o", str(output)], timeout=240)
+    hosts = read_lines(output)
     if result is None or result.returncode != 0:
-        warning("Subfinder did not return results.")
-        return []
-    hosts = read_lines(output_file)
-    info(f"Subfinder: {len(hosts)} results.")
+        warning("Subfinder failed or returned a non-zero exit code; keeping any partial output.")
+    info(f"Subfinder entries: {len(hosts)}")
     return hosts
 
 
-def discover_findomain(domain, work_dir):
-    info("Starting Findomain...")
-    output_file = work_dir / "findomain.txt"
-    result = run_command([
-        "findomain", "-t", domain, "-u", str(output_file)
-    ])
+def discover_findomain(domain: str, work: Path) -> list[str]:
+    info("Running Findomain...")
+    output = work / "findomain.txt"
+    result = run_command(["findomain", "-t", domain, "-u", str(output), "-q"], timeout=240)
+    hosts = read_lines(output)
     if result is None or result.returncode != 0:
-        warning("Findomain did not return results.")
-        return []
-    hosts = read_lines(output_file)
-    info(f"Findomain: {len(hosts)} results.")
+        warning("Findomain failed or returned a non-zero exit code; keeping any partial output.")
+    info(f"Findomain entries: {len(hosts)}")
     return hosts
 
 
-def discover_crtsh(domain):
-    """Optional source: retry once, then continue if crt.sh is unavailable."""
-    info("Querying crt.sh (optional source)...")
-    query = urllib.parse.urlencode({
-        "q": f"%.{domain}", "output": "json"
-    })
-    url = f"https://crt.sh/?{query}"
-
-    for attempt in range(2):
-        try:
-            request = urllib.request.Request(
-                url, headers={"User-Agent": f"ReconFlow/{VERSION}"}
-            )
-            with urllib.request.urlopen(request, timeout=12) as response:
-                data = json.loads(response.read().decode("utf-8"))
-
-            hosts = []
-            for entry in data:
-                name_value = entry.get("name_value", "")
-                if isinstance(name_value, str):
-                    hosts.extend(name_value.splitlines())
-
-            info(f"crt.sh: {len(hosts)} results.")
-            return hosts
-
-        except (
-            urllib.error.URLError, urllib.error.HTTPError,
-            TimeoutError, json.JSONDecodeError, OSError, ValueError
-        ) as exc:
-            if attempt == 0:
-                info("crt.sh request failed; retrying once...")
-            else:
-                warning(
-                    f"crt.sh unavailable ({exc}). Continuing without it."
-                )
-    return []
+def discover_crtsh(domain: str) -> list[str]:
+    info("Querying crt.sh...")
+    query = urllib.parse.urlencode({"q": f"%.{domain}", "output": "json"})
+    request = urllib.request.Request(
+        f"https://crt.sh/?{query}",
+        headers={"User-Agent": f"ReconFlow/{VERSION}"}
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            data = json.loads(response.read().decode("utf-8", errors="replace"))
+        if not isinstance(data, list):
+            raise ValueError("unexpected JSON structure")
+        hosts: list[str] = []
+        for entry in data:
+            if isinstance(entry, dict):
+                names = entry.get("name_value", "")
+                if isinstance(names, str):
+                    hosts.extend(names.splitlines())
+        info(f"crt.sh entries: {len(hosts)}")
+        return hosts
+    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError, ValueError) as exc:
+        warning(f"crt.sh unavailable: {exc}. Continuing with other sources.")
+        return []
 
 
-def run_discovery(domain, work_dir):
-    info("Running passive discovery sources in parallel...")
-    with ThreadPoolExecutor(max_workers=3) as executor:
-        subfinder_job = executor.submit(discover_subfinder, domain, work_dir)
-        findomain_job = executor.submit(discover_findomain, domain, work_dir)
-        crtsh_job = executor.submit(discover_crtsh, domain)
-
-        subfinder_hosts = subfinder_job.result()
-        findomain_hosts = findomain_job.result()
-        crtsh_hosts = crtsh_job.result()
-
-    unique_hosts = sorted(set(
-        subfinder_hosts + findomain_hosts + crtsh_hosts
-    ))
-    info(f"Discovery complete: {len(unique_hosts)} unique entries.")
-    return unique_hosts
-
-
-def normalize_hosts(hosts, domain):
-    clean_hosts = set()
-    for host in hosts:
-        if not isinstance(host, str):
+def normalize_hosts(hosts: Iterable[str], domain: str) -> list[str]:
+    scoped: set[str] = set()
+    for raw in hosts:
+        if not isinstance(raw, str):
             continue
-        host = host.strip().lower().rstrip(".").removeprefix("*.")
+        host = raw.strip().lower()
+        if host.startswith("*."):
+            host = host[2:]
+        if "*" in host or any(char.isspace() for char in host):
+            continue
+        host = host.rstrip(".")
         if not valid_domain(host):
             continue
         if host == domain or host.endswith("." + domain):
-            clean_hosts.add(host)
-    return sorted(clean_hosts)
+            scoped.add(host)
+    return sorted(scoped)
 
 
-def resolve_dns(hosts, work_dir):
-    if not hosts:
-        warning("No in-scope hosts to resolve.")
-        return []
+def dig_response(output: str, returncode: int) -> tuple[str, list[str]]:
+    """Return DNS status and validated A records from ANSWER SECTION only."""
+    if returncode == 9 or re.search(
+        r"connection timed out|communications error|no servers could be reached|network is unreachable",
+        output, re.IGNORECASE
+    ):
+        return "TIMEOUT", []
 
-    info(f"Resolving {len(hosts)} hosts with dnsx...")
-    input_file = work_dir / "scoped.txt"
-    output_file = work_dir / "resolved.txt"
+    match = re.search(r"status:\s*([A-Z]+)", output, re.IGNORECASE)
+    if not match:
+        return "ERROR", []
+    status = match.group(1).upper()
+    if status != "NOERROR":
+        return status, []
 
-    if not save_lines(input_file, hosts):
-        return []
+    answer_match = re.search(
+        r";; ANSWER SECTION:\s*(.*?)(?=\n\s*;;|\Z)",
+        output, re.IGNORECASE | re.DOTALL
+    )
+    ips: set[str] = set()
+    if answer_match:
+        for line in answer_match.group(1).splitlines():
+            fields = line.split()
+            for index in range(len(fields) - 2):
+                if fields[index].upper() == "IN" and fields[index + 1].upper() == "A":
+                    try:
+                        address = ipaddress.ip_address(fields[index + 2])
+                        if address.version == 4:
+                            ips.add(str(address))
+                    except ValueError:
+                        pass
+    return ("RESOLVED", sorted(ips)) if ips else ("NODATA", [])
 
-    result = run_command([
-        "dnsx", "-l", str(input_file), "-silent",
-        "-o", str(output_file)
-    ])
+
+def resolve_tcp(hosts: list[str], resolver: str, timeout: int, retry: int, work: Path) -> tuple[list[str], dict[str, int]]:
+    info(f"Resolving {len(hosts)} hosts sequentially over DNS/TCP via {resolver}...")
+    resolved: list[str] = []
+    stats = {key: 0 for key in ("resolved", "timeout", "nxdomain", "nodata", "servfail", "refused", "other")}
+    for host in hosts:
+        result = run_command(
+            ["dig", "+tcp", f"@{resolver}", host, "A", f"+time={timeout}", f"+tries={retry}"],
+            timeout=timeout * retry + 5
+        )
+        if result is None:
+            stats["timeout"] += 1
+            continue
+        status, _ips = dig_response((result.stdout or "") + "\n" + (result.stderr or ""), result.returncode)
+        if status == "RESOLVED":
+            resolved.append(host)
+            stats["resolved"] += 1
+        elif status == "TIMEOUT":
+            stats["timeout"] += 1
+        elif status == "NXDOMAIN":
+            stats["nxdomain"] += 1
+        elif status == "NODATA":
+            stats["nodata"] += 1
+        elif status == "SERVFAIL":
+            stats["servfail"] += 1
+        elif status == "REFUSED":
+            stats["refused"] += 1
+        else:
+            stats["other"] += 1
+    return sorted(set(resolved)), stats
+
+
+def udp_probe(domain: str, resolver: str, timeout: int) -> bool:
+    result = run_command(
+        ["dig", f"@{resolver}", domain, "A", f"+time={timeout}", "+tries=1"],
+        timeout=timeout + 4
+    )
+    if result is None:
+        return False
+    status, _ = dig_response((result.stdout or "") + "\n" + (result.stderr or ""), result.returncode)
+    return status in {"RESOLVED", "NODATA", "NXDOMAIN", "SERVFAIL", "REFUSED"}
+
+
+def resolve_udp(hosts: list[str], resolver: str, timeout: int, retry: int, work: Path) -> tuple[list[str], bool]:
+    source = work / "dns_input.txt"
+    output = work / "dns_resolved.txt"
+    if not save_lines(source, hosts):
+        return [], False
+    result = run_command(
+        ["dnsx", "-l", str(source), "-r", resolver, "-retry", str(retry),
+         "-timeout", str(timeout), "-silent", "-o", str(output)],
+        timeout=max(60, len(hosts) * timeout * retry + 10)
+    )
     if result is None or result.returncode != 0:
-        warning("DNS resolution did not complete successfully.")
-        return []
+        warning("dnsx UDP resolution failed; transport may be unavailable.")
+        return [], False
+    # Accept only exact hostnames supplied to dnsx; never trust out-of-scope output.
+    allowed = set(hosts)
+    resolved = sorted({line.strip().lower().rstrip(".") for line in read_lines(output)} & allowed)
+    return resolved, True
 
-    resolved = read_lines(output_file)
-    info(f"DNS resolution: {len(resolved)} hosts.")
-    return resolved
 
-
-def probe_http(hosts, work_dir):
+def resolve_hosts(hosts: list[str], domain: str, args: argparse.Namespace, work: Path) -> tuple[list[str], dict[str, int], str]:
+    empty_stats = {key: 0 for key in ("resolved", "timeout", "nxdomain", "nodata", "servfail", "refused", "other")}
     if not hosts:
-        warning("No DNS-resolved hosts to probe.")
-        return []
+        warning("No in-scope hosts were discovered; skipping DNS resolution.")
+        return [], empty_stats, "not run"
 
+    if args.dns_mode == "tcp":
+        resolved, stats = resolve_tcp(hosts, args.resolver, args.timeout, args.retry, work)
+        return resolved, stats, "TCP (dig)"
+
+    if args.dns_mode == "udp":
+        resolved, ok = resolve_udp(hosts, args.resolver, args.timeout, args.retry, work)
+        stats = dict(empty_stats)
+        stats["resolved"] = len(resolved)
+        stats["other"] = max(0, len(hosts) - len(resolved)) if ok else len(hosts)
+        return resolved, stats, "UDP (dnsx; non-resolved results unclassified)"
+
+    info(f"Auto mode: checking UDP DNS reachability to {args.resolver}...")
+    if not udp_probe(domain, args.resolver, args.timeout):
+        warning("UDP DNS probe failed; switching to direct DNS-over-TCP.")
+        resolved, stats = resolve_tcp(hosts, args.resolver, args.timeout, args.retry, work)
+        return resolved, stats, "TCP fallback (UDP probe failed)"
+
+    resolved, ok = resolve_udp(hosts, args.resolver, args.timeout, args.retry, work)
+    if not ok:
+        warning("dnsx failed after UDP probe; switching to direct DNS-over-TCP.")
+        resolved, stats = resolve_tcp(hosts, args.resolver, args.timeout, args.retry, work)
+        return resolved, stats, "TCP fallback (dnsx failed)"
+
+    stats = dict(empty_stats)
+    stats["resolved"] = len(resolved)
+    stats["other"] = max(0, len(hosts) - len(resolved))
+    return resolved, stats, "UDP (dnsx; non-resolved results unclassified)"
+
+
+def probe_http(hosts: list[str], work: Path) -> list[str]:
+    if not hosts:
+        info("No DNS-resolved hosts; skipping HTTP probing.")
+        return []
+    source = work / "http_input.txt"
+    output = work / "httpx.jsonl"
+    if not save_lines(source, hosts):
+        return []
     info(f"Probing {len(hosts)} hosts with ProjectDiscovery httpx...")
-    input_file = work_dir / "resolved.txt"
-    json_file = work_dir / "httpx.json"
-
-    if not save_lines(input_file, hosts):
-        return []
-
-    result = run_command([
-        "httpx", "-l", str(input_file), "-silent",
-        "-status-code", "-title", "-tech-detect",
-        "-web-server", "-ip", "-json", "-o", str(json_file)
-    ], timeout=240)
-
+    result = run_command(
+        ["httpx", "-l", str(source), "-silent", "-status-code", "-title",
+         "-tech-detect", "-web-server", "-ip", "-json", "-o", str(output)],
+        timeout=max(120, len(hosts) * 8)
+    )
     if result is None or result.returncode != 0:
-        warning("HTTP probing did not complete successfully.")
-        return []
-
-    live_results = []
-    for line in read_lines(json_file):
+        warning("ProjectDiscovery httpx did not complete successfully; checking any partial output.")
+    live: set[str] = set()
+    for line in read_lines(output):
         try:
             item = json.loads(line)
-            url = item.get("url", "")
-            status = item.get("status_code")
-            if not url or not isinstance(status, int):
-                continue
-            title = str(item.get("title") or "")
-            title = title.replace("\n", " ").replace("\r", " ").strip()
-            live_results.append(f"{status} | {url} | {title}")
         except json.JSONDecodeError:
+            warning("Skipped a malformed JSON line from httpx output.")
             continue
+        if not isinstance(item, dict):
+            continue
+        url = item.get("url")
+        status = item.get("status_code")
+        if not isinstance(url, str) or not url or not isinstance(status, int):
+            continue
+        title = str(item.get("title") or "").replace("\r", " ").replace("\n", " ").strip()
+        live.add(f"{status} | {url}" + (f" | {title}" if title else ""))
+    info(f"HTTP responsive URLs: {len(live)}")
+    return sorted(live)
 
-    live_results = sorted(set(live_results))
-    info(f"HTTP probing: {len(live_results)} live URLs.")
-    return live_results
 
-
-def generate_report(domain, discovered, scoped, resolved, live):
-    return [
-        "========== ReconFlow Scan Report ==========",
+def make_report(domain: str, counts: dict[str, int], dns_stats: dict[str, int], transport: str, resolver: str, timeout: int, retry: int) -> str:
+    lines = [
+        "=" * 72,
+        "                         ReconFlow Scan Report",
+        "=" * 72,
+        f"Scan time (UTC):          {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}",
+        f"Version:                  {VERSION}",
+        f"Author:                   {AUTHOR}",
+        f"Target domain:            {domain}",
         "",
-        f"Version: {VERSION}",
-        f"Target: {domain}",
+        "1. Passive discovery",
+        f"Subfinder entries:        {counts['subfinder']}",
+        f"Findomain entries:        {counts['findomain']}",
+        f"crt.sh entries:           {counts['crtsh']}",
+        f"Unique entries:           {counts['unique']}",
+        f"In-scope hostnames:       {counts['scoped']}",
         "",
-        f"Unique discovered entries: {len(discovered)}",
-        f"In-scope hostnames: {len(scoped)}",
-        f"DNS-resolved hosts: {len(resolved)}",
-        f"HTTP live URLs: {len(live)}",
+        "2. DNS resolution",
+        f"Resolver:                 {resolver}",
+        f"Transport:                {transport}",
+        f"Timeout / retries:        {timeout}s / {retry}",
+        f"Resolved:                 {dns_stats['resolved']}",
+        f"Timeouts:                 {dns_stats['timeout']}",
+        f"NXDOMAIN:                 {dns_stats['nxdomain']}",
+        f"NODATA:                   {dns_stats['nodata']}",
+        f"SERVFAIL:                 {dns_stats['servfail']}",
+        f"REFUSED:                  {dns_stats['refused']}",
+        f"Other / unclassified:     {dns_stats['other']}",
         "",
-        "========== Live Results ==========",
+        "3. HTTP probing",
+        f"Responsive HTTP URLs:     {counts['live']}",
         "",
-        *(live or ["No HTTP live results found."]),
-        "",
-        "========== End of Report =========="
+        "4. Warnings",
     ]
+    lines.extend([f"- {item}" for item in WARNINGS] if WARNINGS else ["None."])
+    lines.extend(["", "Note: HTTP responsiveness does not establish vulnerability or permission for further testing.",
+                  "Only scan assets you own or are explicitly authorized to assess.", "=" * 72])
+    return "\n".join(lines) + "\n"
 
 
-def build_parser():
-    parser = argparse.ArgumentParser(
+class ReconArgumentParser(argparse.ArgumentParser):
+    def format_help(self) -> str:
+        return BANNER + "\n" + super().format_help()
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = ReconArgumentParser(
         prog="reconflow",
-        description="ReconFlow - Lightweight reconnaissance workflow"
+        description="Lightweight, sequential reconnaissance automation.",
+        epilog="Only scan domains you own or are explicitly authorized to assess."
     )
-    parser.add_argument(
-        "-d", "--domain", required=True,
-        help=(
-            "Target domain (only scan systems you own "
-            "or are authorized to assess)"
-        )
-    )
-    parser.add_argument(
-        "-o", "--output", metavar="FILE",
-        help="Save live HTTP results to a file"
-    )
-    parser.add_argument(
-        "-or", nargs="?", const=True, default=None,
-        dest="report", metavar="REPORT_FILE",
-        help="Print the report, or save it when a filename is supplied"
-    )
-    parser.add_argument(
-        "-s", "-silent", "--silent", action="store_true",
-        dest="silent",
-        help="Hide progress messages (warnings and errors remain visible)"
-    )
-    parser.add_argument(
-        "-v", "--version", action="version",
-        version=(
-            BANNER
-            + f"\n  ReconFlow v{VERSION}\n"
-            + "  Lightweight recon. Clear results. No noise.\n"
-            + f"  Created by {AUTHOR}\n"
-            + "  https://github.com/reixxhaxx-code/ReconFlow\n"
-        )
-    )
+    parser.add_argument("-d", "--domain", required=True, help="Target domain")
+    parser.add_argument("-o", "--output", default="output", metavar="DIR", help="Base output directory (default: output)")
+    parser.add_argument("-s", "-silent", "--silent", action="store_true", help="Suppress informational messages; warnings remain visible")
+    parser.add_argument("--dns-mode", choices=("auto", "udp", "tcp"), default="auto", help="DNS transport mode (default: auto)")
+    parser.add_argument("--resolver", default="8.8.8.8", help="DNS resolver IP address (default: 8.8.8.8)")
+    parser.add_argument("--timeout", type=positive_int, default=3, help="Per-query timeout in seconds (default: 3)")
+    parser.add_argument("--retry", type=positive_int, default=1, help="DNS retry count (default: 1)")
+    parser.add_argument("-v", "--version", action="version", version=f"{BANNER}\nReconFlow v{VERSION} | Created by {AUTHOR}\nhttps://github.com/reixxhaxx-code/ReconFlow\n")
     return parser
 
 
-def main():
+def main() -> int:
     global SILENT
-    args = build_parser().parse_args()
+    parser = build_parser()
+    args = parser.parse_args()
     SILENT = args.silent
-    domain = args.domain.lower().rstrip(".")
+    WARNINGS.clear()
 
+    domain = args.domain.strip().lower().rstrip(".")
     if not valid_domain(domain):
-        error("Invalid domain format.")
-        sys.exit(2)
-    if not check_dependencies():
-        sys.exit(1)
+        error("Invalid domain format. Supply a valid fully-qualified domain name.")
+        return 2
+    try:
+        ipaddress.ip_address(args.resolver)
+    except ValueError:
+        error("--resolver must be an IPv4 or IPv6 address (not a hostname).")
+        return 2
+    if not check_dependencies(args.dns_mode):
+        return 1
 
-    print()
-    info(f"ReconFlow v{VERSION} starting for {domain}")
-    print()
+    target_dir = Path(args.output).expanduser() / domain
+    live_path = target_dir / "live.txt"
+    report_path = target_dir / "report.txt"
+    try:
+        target_dir.mkdir(parents=True, exist_ok=True)
+        # Remove stale results so a failed run cannot leave old data looking current.
+        for old_file in (live_path, report_path):
+            old_file.unlink(missing_ok=True)
+    except OSError as exc:
+        error(f"Cannot prepare output directory: {exc}")
+        return 1
 
-    with tempfile.TemporaryDirectory(prefix="reconflow_") as temp_dir:
-        work_dir = Path(temp_dir)
-        discovered_hosts = run_discovery(domain, work_dir)
-        scoped_hosts = normalize_hosts(discovered_hosts, domain)
-        info(f"In-scope hosts: {len(scoped_hosts)}")
-        resolved_hosts = resolve_dns(scoped_hosts, work_dir)
-        live_results = probe_http(resolved_hosts, work_dir)
+    if not SILENT:
+        print(BANNER)
+        info(f"ReconFlow v{VERSION} | target: {domain} | DNS: {args.dns_mode}")
 
-    if args.report is not None:
-        report = generate_report(
-            domain, discovered_hosts, scoped_hosts,
-            resolved_hosts, live_results
-        )
-        if args.report is True:
-            print("\n".join(report))
-        elif save_lines(args.report, report):
-            info(f"Report saved to {args.report}")
+    counts = {"subfinder": 0, "findomain": 0, "crtsh": 0, "unique": 0, "scoped": 0, "live": 0}
+    dns_stats = {key: 0 for key in ("resolved", "timeout", "nxdomain", "nodata", "servfail", "refused", "other")}
+    transport = "not run"
 
-    if args.output:
-        if save_lines(args.output, live_results):
-            info(f"Live results saved to {args.output}")
-    elif args.report is not True:
-        print("\n========== ReconFlow Live Results ==========")
-        if live_results:
-            for result in live_results:
-                print(result)
-        else:
-            print("No HTTP live results found.")
+    with tempfile.TemporaryDirectory(prefix="reconflow_") as temp:
+        work = Path(temp)
+        subfinder_hosts = discover_subfinder(domain, work)
+        findomain_hosts = discover_findomain(domain, work)
+        crtsh_hosts = discover_crtsh(domain)
+        counts["subfinder"] = len(subfinder_hosts)
+        counts["findomain"] = len(findomain_hosts)
+        counts["crtsh"] = len(crtsh_hosts)
 
-    info("ReconFlow scan completed.")
+        discovered = sorted(set(subfinder_hosts + findomain_hosts + crtsh_hosts))
+        counts["unique"] = len(discovered)
+        scoped = normalize_hosts(discovered, domain)
+        counts["scoped"] = len(scoped)
+        info(f"Unique entries: {len(discovered)} | in-scope: {len(scoped)}")
+
+        resolved, dns_stats, transport = resolve_hosts(scoped, domain, args, work)
+        live = probe_http(resolved, work)
+        counts["live"] = len(live)
+
+    if not save_lines(live_path, live):
+        return 1
+    report = make_report(domain, counts, dns_stats, transport, args.resolver, args.timeout, args.retry)
+    if not write_text(report_path, report):
+        return 1
+
+    info(f"Scan complete. Results: {target_dir}")
+    info(f"  live.txt:   {live_path}")
+    info(f"  report.txt: {report_path}")
+    if not SILENT:
+        print("\n========== Live HTTP Results ==========")
+        print("\n".join(live) if live else "No responsive HTTP URLs found.")
+        print(f"\nReport saved to: {report_path}")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
