@@ -2,192 +2,159 @@
 
 **Lightweight recon. Clear results. No noise.**
 
-ReconFlow is a small command-line reconnaissance workflow I built to make the first steps of recon simple and understandable.
+ReconFlow is a beginner-friendly, sequential reconnaissance workflow that combines passive subdomain discovery, DNS resolution, and HTTP service discovery.
 
-It brings a few useful tools together, runs passive discovery sources at the same time, checks which discovered hosts resolve in DNS, and then finds HTTP services.
+Built by **[reixxhaxx](https://github.com/reixxhaxx-code)** as a hands-on cybersecurity learning project.
 
-I built this project while learning Python and cybersecurity. The goal is not to replace big recon frameworks. I wanted something lightweight that I can understand, use, improve, and keep learning from.
+> Use only on domains you own or have explicit permission to assess. Passive discovery does not authorize active DNS or HTTP probing.
 
-**Created by [reixxhaxx](https://github.com/reixxhaxx-code)**
+## Features
 
----
-
-## What it does
-
-- Finds subdomains with **Subfinder**
-- Finds subdomains with **Findomain**
-- Gets certificate transparency results from **crt.sh** (optional)
-- Runs the three discovery sources in parallel
-- Cleans, deduplicates, and keeps results inside the target domain
-- Resolves discovered hosts with **dnsx**
-- Checks HTTP/HTTPS services with **ProjectDiscovery httpx**
-- Shows status codes and page titles
-- Can save live results or a scan report
-- Uses temporary files for intermediate data, then cleans them up
-
-## Tools used
-
-| Tool | What ReconFlow uses it for |
-|---|---|
-| [Subfinder](https://github.com/projectdiscovery/subfinder) | Passive subdomain discovery |
-| [Findomain](https://github.com/Findomain/Findomain) | Subdomain discovery |
-| [crt.sh](https://crt.sh/) | Certificate transparency lookup |
-| [dnsx](https://github.com/projectdiscovery/dnsx) | DNS resolution |
-| [httpx](https://github.com/projectdiscovery/httpx) | HTTP probing |
+- Passive subdomain discovery with [Subfinder](https://github.com/projectdiscovery/subfinder)
+- Additional discovery with [Findomain](https://github.com/Findomain/Findomain)
+- Certificate Transparency lookup through [crt.sh](https://crt.sh/)
+- Hostname normalization, deduplication, and strict in-scope filtering
+- DNS resolution with selectable `auto`, `udp`, and `tcp` modes
+- In `auto` mode, checks UDP DNS first and falls back to direct DNS-over-TCP when the UDP probe or dnsx fails
+- HTTP/HTTPS probing with [ProjectDiscovery httpx](https://github.com/projectdiscovery/httpx)
+- Temporary intermediate files; only final result files are retained
+- Sequential execution: no threads, multiprocessing, or async workers
 
 ## Requirements
 
-- Linux is recommended (Kali or Parrot works)
+- Linux (Kali or Parrot recommended)
 - Python 3.9+
 - Subfinder
 - Findomain
-- dnsx
+- dig (usually provided by dnsutils or bind utilities)
+- dnsx (required for `auto` and `udp` modes)
 - ProjectDiscovery httpx
-- Internet connection for online discovery sources
+- Internet access for discovery sources
 
-The external tools must be installed and available in your system PATH.
-
-> Make sure ProjectDiscovery's httpx is installed, not the Python HTTPX package.
+Make sure ProjectDiscovery's `httpx` is installed, not the unrelated Python HTTPX package. All external executables must be available in your `PATH`.
 
 ## Installation
 
-Clone the repository:
-
-~~~bash
+```bash
 git clone https://github.com/reixxhaxx-code/ReconFlow.git
 cd ReconFlow
-~~~
-
-Make sure the required tools are installed and available:
-
-~~~bash
-subfinder -version
-findomain --help
-dnsx -version
-httpx -version
-~~~
-
-Run ReconFlow:
-
-~~~bash
+chmod +x reconflow.py
 python3 reconflow.py -h
-~~~
+```
 
-No extra Python packages are required. ReconFlow uses Python's standard library.
+ReconFlow uses only Python's standard library; no `pip install` step is required.
 
 ## Usage
 
-Basic scan:
+Show help:
 
-~~~bash
-python3 reconflow.py -d example.com
-~~~
+```bash
+python3 reconflow.py -h
+```
 
-Show the logo and version:
+Show logo and version:
 
-~~~bash
+```bash
 python3 reconflow.py -v
-~~~
+```
 
-Hide progress messages:
+Basic scan (auto DNS mode):
 
-~~~bash
+```bash
+python3 reconflow.py -d example.com
+```
+
+Choose DNS transport:
+
+```bash
+python3 reconflow.py -d example.com --dns-mode auto
+python3 reconflow.py -d example.com --dns-mode tcp
+python3 reconflow.py -d example.com --dns-mode udp
+```
+
+Use a different resolver, timeout, or retry count:
+
+```bash
+python3 reconflow.py -d example.com --resolver 8.8.8.8 --timeout 3 --retry 1
+```
+
+Choose an output base directory:
+
+```bash
+python3 reconflow.py -d example.com -o results
+```
+
+Suppress informational progress messages:
+
+```bash
 python3 reconflow.py -d example.com -s
-~~~
+```
 
-Save live HTTP results:
+## DNS modes
 
-~~~bash
-python3 reconflow.py -d example.com -o live.txt
-~~~
+| Mode | Behavior |
+|---|---|
+| `auto` | Tests UDP DNS reachability. Uses dnsx when reachable; falls back to sequential `dig +tcp` when UDP probing or dnsx fails. |
+| `udp` | Uses dnsx over UDP. Unresolved results are reported as unclassified because dnsx output does not provide per-host DNS status classification here. |
+| `tcp` | Resolves hosts sequentially using `dig +tcp`. |
 
-Print a detailed report:
+The TCP fallback is a code-side transport choice. ReconFlow does not modify Kali's resolver configuration. Discovery tools and the crt.sh HTTPS request may still use the system's normal name-resolution/network path.
 
-~~~bash
-python3 reconflow.py -d example.com -or
-~~~
+## Output
 
-Save the report:
+Each run creates a target-specific directory, for example:
 
-~~~bash
-python3 reconflow.py -d example.com -or report.txt
-~~~
+```text
+output/
+└── example.com/
+    ├── live.txt
+    └── report.txt
+```
 
-Save both live results and the report:
+- **live.txt** — HTTP-responsive URLs, including their status codes and available page titles.
+- **report.txt** — discovery counts, DNS transport and resolution statistics, and warnings.
 
-~~~bash
-python3 reconflow.py -d example.com -o live.txt -or report.txt
-~~~
+Intermediate files are stored in a temporary directory and automatically cleaned up.
 
-## How the workflow runs
+## Workflow
 
-~~~text
-                 ReconFlow
-                     |
-          +----------+----------+
-          |          |          |
-       Subfinder  Findomain   crt.sh
-          |          |          |
-          +----------+----------+
-                     |
-             Merge + deduplicate
-                     |
-              Scope filtering
-                     |
-                   dnsx
-                     |
-          ProjectDiscovery httpx
-                     |
-              Live HTTP results
-                     |
-                Report / file
-~~~
+```text
+Subfinder
+   |
+Findomain
+   |
+crt.sh
+   |
+Merge + deduplicate
+   |
+Normalize + enforce target scope
+   |
+DNS resolution (auto / UDP / TCP)
+   |
+ProjectDiscovery httpx
+   |
+live.txt + report.txt
+```
 
-Discovery runs in parallel. DNS resolution and HTTP probing run in order because HTTP probing needs the DNS-resolved hosts.
+## Important notes and limitations
 
-## crt.sh note
-
-crt.sh is an optional source and can sometimes fail because of DNS, network, rate limits, or service availability. ReconFlow retries once and continues with the other discovery sources if crt.sh is unavailable.
-
-A crt.sh failure does not mean the entire scan has failed.
-
-## Example output
-
-~~~text
-========== ReconFlow Live Results ==========
-200 | https://www.example.com | Example Domain
-301 | https://old.example.com |
-403 | https://private.example.com | Forbidden
-~~~
-
-The output above is only an example.
-
-## Important limitations
-
-- This is an early learning project, not a production-grade scanner.
-- Results depend on the tools, data sources, DNS, and network conditions.
-- Passive discovery cannot find every subdomain.
+- ReconFlow is an early-stage learning project, not a production-grade scanner.
+- Passive discovery sources can be incomplete or temporarily unavailable.
+- DNS and HTTP results depend on resolver behavior, network policy, and target availability.
 - A host responding over HTTP does not mean it is vulnerable.
-- HTTP status codes such as 401, 403, and 404 are still useful responses.
-- ReconFlow does not perform vulnerability testing or exploitation.
-- Only basic error handling and source fallback are included.
+- HTTP status codes such as 401, 403, and 404 are still valid responsive-service observations.
+- ReconFlow performs discovery and HTTP service probing; it does not perform vulnerability testing or exploitation.
+- TCP fallback applies to ReconFlow's explicit DNS-resolution stage. It does not force every third-party discovery tool or HTTPS client to use TCP DNS.
+- The default resolver is 8.8.8.8; choose a resolver appropriate for your environment if needed.
 
 ## Responsible use
 
-Use ReconFlow only on domains and systems you own or have explicit permission to assess.
+Only scan domains and systems you own or have explicit permission to assess. Confirm the authorized scope and rules before running active DNS resolution or HTTP probing. You are responsible for complying with applicable laws and program policies.
 
-Passive discovery does not give permission to actively probe a website. Make sure you have authorization before running DNS resolution or HTTP probing against a target.
+## Project
 
-You are responsible for following the target's rules, scope, and applicable laws.
-
-## Why I made it
-
-I made ReconFlow as a hands-on project to learn Python, Linux, subprocesses, automation, reconnaissance, and how security tools work together.
-
-It is a small project, and I plan to improve it based on actual use and feedback instead of adding features just for the sake of it.
-
-If you try it and find a bug or have a useful suggestion, feel free to open an issue.
+This is a learning project created to practice Python, Linux, subprocess handling, DNS, HTTP probing, and security-tool automation. Feedback and bug reports are welcome through GitHub Issues.
 
 ---
 
-**ReconFlow v0.1.0 — made by reixxhaxx.**
+**ReconFlow v0.2.1 — created by reixxhaxx.**
